@@ -26,7 +26,7 @@ import type { AuthInfo as SdkAuthInfo } from '@modelcontextprotocol/sdk/server/a
 import { InvalidTokenError, InvalidClientMetadataError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { hashToken, generateToken, isUndefinedColumnError } from './utils.ts';
 import { assertValidSourceId } from './source-id.ts';
-import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
+import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError, DCR_DEFAULT_SCOPE } from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
 import { parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions } from './legacy-token-scope.ts';
 
@@ -345,11 +345,22 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
       validateRedirectUri(String(uri));
     }
 
+    // A DCR request that omits `scope` (managed MCP connectors do this) would
+    // otherwise be stored with an empty grant, which the authorize clamp can
+    // only ever narrow to [] — every minted token scopeless, every op
+    // `insufficient_scope`. Default the missing/blank scope to read+write (see
+    // DCR_DEFAULT_SCOPE); an explicit request is kept verbatim. Never defaults
+    // to admin — a consent-flow self-registration must not mint the master key.
+    const effectiveScope = parseScopeString(client.scope).length > 0
+      ? (client.scope as string)
+      : DCR_DEFAULT_SCOPE;
+
     // v0.28: ALLOWED_SCOPES allowlist. RFC 6749 §5.2 invalid_scope. The DCR
     // path is reachable by any unauthenticated network caller when --enable-dcr
     // is on, so this is the security-relevant gate (manual CLI registration
-    // is operator-trusted).
-    assertAllowedScopes(parseScopeString(client.scope));
+    // is operator-trusted). Validate the EFFECTIVE scope so an explicit bad
+    // request is still rejected while the default stays inside the allowlist.
+    assertAllowedScopes(parseScopeString(effectiveScope));
 
     // v0.41.3 (T5): validate token_endpoint_auth_method on the DCR path so
     // `--enable-dcr` is not the looser entry point. CLI and admin paths gate
@@ -406,7 +417,7 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
         VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
                 ${pgArray((client.redirect_uris || []).map(String))},
                 ${pgArray(grantTypes)},
-                ${client.scope || ''}, ${authMethod},
+                ${effectiveScope}, ${authMethod},
                 ${now}, ${'default'}, ${pgArray(['default'])})
       `;
     } catch (err) {
@@ -419,7 +430,7 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
             VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
                     ${pgArray((client.redirect_uris || []).map(String))},
                     ${pgArray(grantTypes)},
-                    ${client.scope || ''}, ${authMethod},
+                    ${effectiveScope}, ${authMethod},
                     ${now}, ${'default'})
           `;
         } catch (err2) {
@@ -431,7 +442,7 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
               VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
                       ${pgArray((client.redirect_uris || []).map(String))},
                       ${pgArray(grantTypes)},
-                      ${client.scope || ''}, ${authMethod},
+                      ${effectiveScope}, ${authMethod},
                       ${now})
             `;
           } else {
@@ -446,7 +457,7 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
           VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
                   ${pgArray((client.redirect_uris || []).map(String))},
                   ${pgArray(grantTypes)},
-                  ${client.scope || ''}, ${authMethod},
+                  ${effectiveScope}, ${authMethod},
                   ${now})
         `;
       } else {
@@ -482,6 +493,10 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
     // exactly once — same shape as before.
     const response: OAuthClientInformationFull = {
       ...client,
+      // Echo the EFFECTIVE scope (RFC 7591 §3.2.1) so a client that omitted
+      // `scope` sees the read+write default it was actually granted, not the
+      // blank it sent.
+      scope: effectiveScope,
       client_id: clientId,
       client_id_issued_at: now,
     };

@@ -24,6 +24,18 @@
 
 export type Scope = 'read' | 'write' | 'admin' | 'sources_admin' | 'users_admin' | 'agent';
 
+/**
+ * Default scope for a Dynamic Client Registration (RFC 7591) request that omits
+ * `scope`. Managed MCP connectors (claude.ai and others) register without a
+ * scope field; storing '' left the client with an empty registered grant, so
+ * the authorize-grant clamp (request ∩ registered) could only ever yield [] and
+ * every minted token was scopeless — OAuth completes, then every op fails
+ * `insufficient_scope`. Default to everyday read+write, deliberately NOT `admin`:
+ * a DCR client uses the consent-bearing authorization_code flow, so an
+ * unauthenticated self-registration must never get the master key by default.
+ */
+export const DCR_DEFAULT_SCOPE = 'read write';
+
 export const ALLOWED_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
   'read',
   'write',
