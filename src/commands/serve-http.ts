@@ -823,6 +823,39 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   app.use(cookieParser());
 
   // ---------------------------------------------------------------------------
+  // Discovery + OAuth-endpoint request logging (to stderr)
+  // ---------------------------------------------------------------------------
+  // These endpoints run BEFORE any token exists, so mcp_request_log (which only
+  // records authenticated MCP ops) never captured them. A client that failed
+  // during discovery or registration therefore left NO trace anywhere — the
+  // exact "we have no idea what the client did" gap. Log the auth-relevant
+  // surface to stderr (Railway/journald/etc. capture it) so a connecting
+  // client's path is visible: which well-known doc it fetched, whether it
+  // reached /register or /authorize, and the status it got. Low volume (a
+  // handful of lines per connect) and secret-free — client_id is public, the
+  // token-exchange `code`/secret live in the POST body which is never read here.
+  app.use((req, res, next) => {
+    const p = req.path;
+    const isAuthPath =
+      p.startsWith('/.well-known/') ||
+      p === '/register' || p === '/authorize' || p === '/token' || p === '/revoke';
+    if (isAuthPath) {
+      res.on('finish', () => {
+        const cid = typeof req.query?.client_id === 'string' ? req.query.client_id : '';
+        const redir = typeof req.query?.redirect_uri === 'string' ? req.query.redirect_uri : '';
+        const ua = req.get('user-agent') || '';
+        process.stderr.write(
+          `[oauth] ${req.method} ${p} -> ${res.statusCode}` +
+          (cid ? ` client_id=${cid.slice(0, 20)}` : '') +
+          (redir ? ` redirect_uri=${redir.slice(0, 60)}` : '') +
+          (ua ? ` ua="${ua.slice(0, 60)}"` : '') + '\n',
+        );
+      });
+    }
+    next();
+  });
+
+  // ---------------------------------------------------------------------------
   // CORS (v0.41.3, T7 — default-deny on every OAuth endpoint)
   // ---------------------------------------------------------------------------
   // Pre-v0.41.3 every OAuth endpoint used bare `cors()` which defaults to
@@ -854,6 +887,33 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   app.use('/authorize', cors(corsOAuthOptions));
   app.use('/register', cors(corsOAuthOptions));
   app.use('/revoke', cors(corsOAuthOptions));
+
+  // /mcp transport logging (to stderr). requireBearerAuth on the POST route
+  // rejects an unauthenticated/invalid-token request with a 401 BEFORE the
+  // handler's mcp_request_log write runs, so a connector whose token is
+  // rejected at the transport was previously invisible in every log — the
+  // "authenticated fine but nothing happens" black hole. This runs ahead of
+  // requireBearerAuth and logs on response-finish, capturing that 401 (and the
+  // 405 GET probe, and successful sessions). Whether an Authorization header
+  // was present is the key discriminator: auth=NO means the client never
+  // presented a token (discovery/registration never completed); auth=yes with
+  // 401 means the token itself was rejected. Secret-free (header presence only,
+  // never its value).
+  app.use('/mcp', (req: Request, res: Response, next: NextFunction) => {
+    const started = Date.now();
+    const hasAuth = !!req.headers.authorization;
+    const accept = req.get('accept') || '';
+    const ua = req.get('user-agent') || '';
+    res.on('finish', () => {
+      const rpc = (req.body && typeof req.body === 'object' && typeof (req.body as any).method === 'string')
+        ? (req.body as any).method : '';
+      process.stderr.write(
+        `[mcp] ${req.method} /mcp -> ${res.statusCode} auth=${hasAuth ? 'yes' : 'NO'}` +
+        ` rpc=${rpc || '?'} accept="${accept.slice(0, 45)}" ua="${ua.slice(0, 50)}" ${Date.now() - started}ms\n`,
+      );
+    });
+    next();
+  });
 
   // #2179: capture the optional `token_ttl_seconds` DCR extension field
   // BEFORE the SDK's /register handler runs — its request schema strips
@@ -1131,6 +1191,36 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // to the constructor is sufficient. No monkey-patching here.
 
   const authRouter = mcpAuthRouter(authRouterOptions);
+
+  // RFC 9728 / MCP auth spec (2025-06-18) path-suffixed discovery.
+  // The SDK's mcpAuthRouter serves metadata ONLY at the bare well-known paths
+  // (/.well-known/oauth-protected-resource). But a client connecting to the
+  // resource at `${issuer}/mcp` derives the metadata URL by inserting the
+  // well-known segment BEFORE the resource path —
+  // /.well-known/oauth-protected-resource/mcp — per RFC 9728 §3.1. Clients that
+  // build this URL themselves (rather than following the 401 WWW-Authenticate
+  // pointer) got a 404 here and aborted discovery, never registering. ChatGPT
+  // used the bare path and worked; stricter clients don't. Serve the suffixed
+  // protected-resource doc directly with the resource-specific identifier
+  // (resource = `${issuer}/mcp`, not the bare issuer the base doc returns), and
+  // alias the authorization-server suffix to the base so the SDK router (and the
+  // client_credentials patch below) answer it.
+  const issuerNoSlash = issuerUrl.toString().replace(/\/$/, '');
+  app.get('/.well-known/oauth-protected-resource/mcp', (_req: Request, res: Response) => {
+    res.json({
+      resource: `${issuerNoSlash}/mcp`,
+      authorization_servers: [issuerUrl.toString()],
+      scopes_supported: [...ALLOWED_SCOPES_LIST],
+      resource_name: 'GBrain MCP Server',
+    });
+  });
+  app.use((req: Request, _res: Response, next: NextFunction) => {
+    if (req.method === 'GET' && req.path === '/.well-known/oauth-authorization-server/mcp') {
+      const qs = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+      req.url = '/.well-known/oauth-authorization-server' + qs;
+    }
+    next();
+  });
 
   // Patch the SDK's OAuth metadata to include client_credentials grant type.
   // The SDK hardcodes ['authorization_code', 'refresh_token'] — we intercept
